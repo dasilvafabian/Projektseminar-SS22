@@ -1,0 +1,445 @@
+import pandas as pd
+import time
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import f1_score
+from sklearn.metrics import mean_squared_error
+import seaborn as sns
+import matplotlib.pyplot as plt
+from itertools import product
+from imblearn.over_sampling import RandomOverSampler 
+from sklearn.preprocessing import MinMaxScaler
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Activation
+from sklearn.metrics import mean_absolute_error
+from datetime import datetime 
+
+
+
+
+# Benötigte Dateien:
+# - Unfallorte 2016 bis einschl. 2020
+# - bevölkerung.csv
+# - zulassungszahlen.csv
+# - für den Testmodus: daten.csv
+# - Daten für die fertige Prognose
+
+# Der Testmodus ermöglicht es die Schritte, welche die Daten einlesen und vorbereiten 
+# zu überspringen und hat eine entsprechend kürzere Laufzeit zur Folge
+Testmodus=True
+
+def unfallDatenEinlesen():
+    """Die Funktion liest die Unfalldaten ein, fügt sie in einem Dataframe zusammen und löscht nicht relevante Attribute"""
+    u16 = pd.read_csv("Unfallorte_2016_LinRef.txt", delimiter=";")
+    u17 = pd.read_csv("Unfallorte2017_LinRef.txt", delimiter=";").reset_index(drop=True)
+    u18 = pd.read_csv("Unfallorte2018_LinRef.txt", delimiter=";").reset_index(drop=True)
+    u19 = pd.read_csv("Unfallorte2019_LinRef.txt", delimiter=";").reset_index(drop=True)
+    u20 = pd.read_csv("Unfallorte2020_LinRef.csv", delimiter=";").reset_index(drop=True)
+    # Spaltennamen anpassen
+    u17.rename(columns = {'LICHT':'ULICHTVERH'}, inplace = True)
+    u16.rename(columns = {'IstStrasse':'STRZUSTAND'}, inplace = True)
+    u19.rename(columns = {'IstSonstige':'IstSonstig'}, inplace = True)
+    u20.rename(columns = {'IstSonstige':'IstSonstig'}, inplace = True)
+    alle=pd.concat([u16, u17, u18, u19, u20], axis=0).reset_index().fillna(0)
+    # Khfz auf sonstige addieren
+    alle["IstSonstig"]+=alle["IstGkfz"]
+    alle["IstSonstig"].replace(2,1)
+    # Nicht benötigte Attribute löschen
+    alle=alle.drop(["UIDENTSTLA","UIDENTSTLAE","IstGkfz","OBJECTID_1","FID","OBJECTID","XGCSWGS84","YGCSWGS84"],axis=1)
+    # AGS erstellen
+    alle["ULAND"]=alle["ULAND"].astype("string").str.zfill(2)
+    alle["UKREIS"]=alle["UKREIS"].astype("string").str.zfill(2)
+    alle["UGEMEINDE"]=alle["UGEMEINDE"].astype("string").str.zfill(3)
+    alle["AGS"]=alle["ULAND"].map(str)+alle["UREGBEZ"].map(str)+alle["UKREIS"].map(str)+alle["UGEMEINDE"].map(str)
+    alle=alle.drop(["UREGBEZ","UKREIS","UGEMEINDE"],axis=1)
+    return(alle)
+
+def regionalklassenErzeugen():
+    """Die Funktion erstellt ein Dataframe, welches die Regionalklassen und die Anzahl der zugelassenen Fahrzeuge
+    je Zulassungsbezirk für das Bundesland Sachsen, sowie die Koordinaten der Zulassungsbezirke beinhaltet."""
+    RKHaftpflicht = [2,6,10,2,1,2,9,2,1,2,3,4,3]
+    RKVollkasko = [4,5,4,4,6,5,7,3,4,4,5,4,4]
+    RKTeilkasko = [9,8,6,9,11,10,8,8,9,10,8,7,8]
+    Zulassungsbezirke = pd.DataFrame(list(zip(RKHaftpflicht, RKVollkasko, RKTeilkasko)), columns = ["RKHaftpflicht","RKVollkasko","RKTeilkasko"])
+    return(Zulassungsbezirke)
+
+def bevölkerungsDatenEinlesen():
+    datenBevölkerung=pd.read_csv("bevölkerung.csv",delimiter=";")
+    Zulassungsbezirke=regionalklassenErzeugen()
+    dictRKH=dict(Zulassungsbezirke["RKHaftpflicht"].reset_index(level=0).values)
+    dictRKV=dict(Zulassungsbezirke["RKVollkasko"].reset_index(level=0).values)
+    dictRKT=dict(Zulassungsbezirke["RKTeilkasko"].reset_index(level=0).values)
+    datenBevölkerung["RKHaftpflicht"]=datenBevölkerung["Bezirk"].map(dictRKH)
+    datenBevölkerung["RKVollkasko"]=datenBevölkerung["Bezirk"].map(dictRKV)
+    datenBevölkerung["RKTeilkasko"]=datenBevölkerung["Bezirk"].map(dictRKT)
+    datenBevölkerung["Kreis"]=datenBevölkerung["Kreis"].astype("int").astype("string").str.zfill(2)
+    datenBevölkerung["Gem"]=datenBevölkerung["Gem"].astype("int").astype("string").str.zfill(3)
+    datenBevölkerung["AGS"]=datenBevölkerung["Land"].astype("int").map(str)+datenBevölkerung["RB"].astype("int").map(str)+datenBevölkerung["Kreis"].map(str)+datenBevölkerung["Gem"].map(str)
+    datenBevölkerung=datenBevölkerung.drop(["Land","Bezeichnung"],axis=1)
+    datenBevölkerung["Kreis"]=datenBevölkerung["Kreis"].astype("int")
+    datenBevölkerung["Gem"]=datenBevölkerung["Gem"].astype("int")
+    return(datenBevölkerung)
+
+def datenAggregieren(daten):
+    """Die Funktion aggregiert ein gegebenes DF mit Unfalldaten und gibt die Anzahl aller Unfälle für
+    jede Kombination aus Jahr/Monat/AGS in Sachsen an."""    
+    # Alle Bundesländer außer Sachsen löschen
+    datenSachsen=daten.loc[(daten["ULAND"] == "14")]
+    neu1=datenSachsen[["AGS","UJAHR","UMONAT","USTUNDE"]].groupby(["AGS","UJAHR","UMONAT"]).count().reset_index()
+    neu1.rename(columns = {'USTUNDE':'UANZAHL'}, inplace = True)
+    # Datenpunkte ohne Unfälle erzeugen
+    neu2=pd.DataFrame(list(product(pd.unique(neu1["AGS"]), range(2016,2021), range(1,13))), columns=["AGS","UJAHR","UMONAT"])
+    neu2["UANZAHL"]=0
+    # In einem DataFrame kombinieren
+    datenSachsenAgg = pd.concat([neu2, neu1], axis=0).groupby(["AGS","UJAHR","UMONAT"]).sum().reset_index()
+    return(datenSachsenAgg)
+
+#datenAggregieren(unfallDatenEinlesen())
+
+def datenMergen():
+    bevölkerungsDaten=bevölkerungsDatenEinlesen()
+    datenSachsenAgg=datenAggregieren(unfallDatenEinlesen())
+    gemergteDaten=datenSachsenAgg.merge(right=bevölkerungsDaten, how="left", left_on="AGS", right_on="AGS")
+    return(gemergteDaten)
+            
+def regKlassenUndAnzFahrzeugehinzufügen():
+    daten=datenMergen()
+    # Jahresaktuelle Zulassungszahlen per Dictionary mappen
+    daten["Bez+Jahr"]=daten["Bezirk"].astype("int").map(str)+daten["UJAHR"].map(str)
+    AnzFahrzeuge=pd.read_csv("zulassungszahlen.csv",delimiter=";")
+    AnzFahrzeuge = AnzFahrzeuge.set_index(AnzFahrzeuge["Bezirk"].map(str)+AnzFahrzeuge["Jahr"].map(str))
+    dictZul=dict(AnzFahrzeuge["Absolut"])
+    daten["Anz_Fahrzeuge"]=daten["Bez+Jahr"].map(dictZul)
+    daten = daten.drop(["Bez+Jahr"],axis=1)
+    daten["ID"]=daten.index
+    return(daten)
+
+def naiverPredictor1(jahr):
+    global daten
+    if Testmodus:
+        daten=pd.read_csv("daten.csv")
+    else:
+        daten=regKlassenUndAnzFahrzeugehinzufügen()
+    y_test = daten["UANZAHL"].loc[(daten["UJAHR"] == jahr)]
+    daten["UANZAHL"] = 0
+    y_naiv = daten["UANZAHL"].loc[(daten["UJAHR"] == jahr)]
+    print("F1-Score, naiv:",f1_score(y_test, y_naiv, average='micro'))
+    print("MSE, naiv:",mean_squared_error(y_test, y_naiv))
+    return()
+
+
+def naiverPredictor2(jahr):
+    global daten
+    if Testmodus:
+        daten=pd.read_csv("daten.csv")
+    else:
+        daten=regKlassenUndAnzFahrzeugehinzufügen()
+    y_test = daten["UANZAHL"].loc[(daten["UJAHR"] == jahr)]
+    daten["UANZAHL"] = 2,4639
+    y_naiv = daten["UANZAHL"].loc[(daten["UJAHR"] == jahr)]
+    #print("F1-Score, naiv:",f1_score(y_test, y_naiv, average='micro'))
+    print("MSE, naiv:",mean_squared_error(y_test, y_naiv))
+    return()
+
+
+def naiverPredictor3(jahr):
+    global daten
+    if Testmodus:
+        daten=pd.read_csv("daten.csv")
+    else:
+        daten=regKlassenUndAnzFahrzeugehinzufügen()
+    y_test = daten["UANZAHL"].loc[(daten["UJAHR"] == jahr)]
+    y_naiv = daten["UANZAHL"].loc[(daten["UJAHR"] == jahr-1)]
+    print("F1-Score, naiv:",f1_score(y_test, y_naiv, average='micro'))
+    print("MSE, naiv:",mean_squared_error(y_test, y_naiv))
+    return()
+
+
+def ranForest(without, year):
+    """Die Funktion erstellt mittels Random Forest eine Vorhersage für dia Anz. an Unfällen und gibt den
+    MSE und F1-Score dieser Schätzung aus."""
+    if Testmodus:
+        daten=pd.read_csv("daten.csv").drop(without,axis=1)
+    else:
+        daten=regKlassenUndAnzFahrzeugehinzufügen()
+    X_train = daten.drop("UANZAHL",axis=1).loc[(daten["UJAHR"] < year)]
+    X_test = daten.drop("UANZAHL",axis=1).loc[(daten["UJAHR"] == year)]
+    y_train = daten["UANZAHL"].loc[(daten["UJAHR"] < year)]
+    y_test = daten["UANZAHL"].loc[(daten["UJAHR"] == year)]
+    #rus = RandomOverSampler(random_state=42)
+    #X_train, y_train = rus.fit_resample(X_train, y_train)
+    rf = RandomForestRegressor(random_state=42)
+    #rf = RandomForestClassifier(class_weight="balanced",random_state=42)
+    #rf = RandomForestClassifier()
+    rf.fit(X_train,y_train)
+    y_pred_test = rf.predict(X_test).round()
+    pd.Series(y_pred_test).to_csv("pred_RF.csv",index=False)
+    # print("F1-Score, RF:",f1_score(y_test, y_pred_test, average='micro'))
+    # print("MSE, RF:",mean_squared_error(y_test, y_pred_test))
+    return(f1_score(y_test, y_pred_test, average='micro'),mean_squared_error(y_test, y_pred_test))
+
+
+def ranForest(without, year):
+    """Die Funktion erstellt mittels Random Forest und Oversampling eine Vorhersage für dia Anz. an Unfällen und gibt den
+    MSE und F1-Score dieser Schätzung aus."""
+    if Testmodus:
+        daten=pd.read_csv("daten.csv").drop(without,axis=1)
+    else:
+        daten=regKlassenUndAnzFahrzeugehinzufügen()
+    X_train = daten.drop("UANZAHL",axis=1).loc[(daten["UJAHR"] < year)]
+    X_test = daten.drop("UANZAHL",axis=1).loc[(daten["UJAHR"] == year)]
+    y_train = daten["UANZAHL"].loc[(daten["UJAHR"] < year)]
+    y_test = daten["UANZAHL"].loc[(daten["UJAHR"] == year)]
+    rus = RandomOverSampler(random_state=42)
+    X_train, y_train = rus.fit_resample(X_train, y_train)
+    rf = RandomForestClassifier(class_weight="balanced",random_state=42)
+    rf.fit(X_train,y_train)
+    y_pred_test = rf.predict(X_test).round()
+    pd.Series(y_pred_test).to_csv("pred_RF.csv",index=False)
+    return(f1_score(y_test, y_pred_test, average='micro'),mean_squared_error(y_test, y_pred_test))
+
+
+def random_forest_splitting_1(without):
+    start = time.time()
+    if Testmodus:
+        daten=pd.read_csv("daten.csv").drop(without,axis=1)
+        daten2=pd.read_csv("daten.csv").drop(without,axis=1)
+    else:
+        return
+        #daten=regKlassenUndAnzFahrzeugehinzufügen()
+    # Neues Attribut hinzufügen
+    daten.loc[daten['UANZAHL'] > 0, 'ZV_neu'] = 1
+    daten.loc[daten['UANZAHL'] == 0, 'ZV_neu'] = 0
+    
+    # Klassifikation
+    train = daten.loc[(daten["UJAHR"] < 2019)]
+    test = daten.loc[(daten["UJAHR"] == 2019)].reset_index(drop=True)
+    
+    rf = RandomForestClassifier(class_weight="balanced",random_state=42)
+    rf.fit(train.drop(["UANZAHL","ZV_neu"],axis=1),train["ZV_neu"])
+    test["pred_1"] = pd.Series(rf.predict(test.drop(["UANZAHL","ZV_neu"],axis=1)))
+    train["pred_1"] = pd.Series(rf.predict(train.drop(["UANZAHL","ZV_neu"],axis=1)))
+    
+    # Regression
+    testset_2 = test.loc[(test["pred_1"] == 1)].reset_index(drop=True)
+    trainset_2 = train.loc[(train["pred_1"] == 1)]
+    nicht_unfälle = test.loc[(test["pred_1"] == 0)].reset_index(drop=True)
+    
+    rf = RandomForestRegressor(random_state=42)
+    rf.fit(trainset_2.drop(["UANZAHL","ZV_neu","pred_1"],axis=1),trainset_2["UANZAHL"])
+    testset_2["pred_1"] = pd.Series(rf.predict(testset_2.drop(["UANZAHL","ZV_neu","pred_1"],axis=1)).round())
+    
+    ganzes_testset = pd.concat([nicht_unfälle,testset_2], ignore_index = True, sort = False)
+    
+    print("MSE:",mean_squared_error(ganzes_testset["UANZAHL"], ganzes_testset["pred_1"]))
+    print("F1-Score:",f1_score(ganzes_testset["UANZAHL"], ganzes_testset["pred_1"], average='micro'))
+    print("Laufzeit:",time.time() - start)
+    
+
+def random_forest_splittin_2(without):
+    start = time.time()
+    if Testmodus:
+        daten=pd.read_csv("daten.csv").drop(without,axis=1)
+        daten2=pd.read_csv("daten.csv").drop(without,axis=1)
+    else:
+        return
+        #daten=regKlassenUndAnzFahrzeugehinzufügen()
+    # Neues Attribut hinzufügen
+    daten.loc[daten['UANZAHL'] > 4, 'ZV_neu'] = 1
+    daten.loc[daten['UANZAHL'] <= 4, 'ZV_neu'] = 0
+
+    
+    # Klassifikation
+    train = daten.loc[(daten["UJAHR"] < 2019)]
+    test = daten.loc[(daten["UJAHR"] == 2019)].reset_index(drop=True)
+    
+    rf = RandomForestClassifier(class_weight="balanced",random_state=42)
+    rf.fit(train.drop(["UANZAHL","ZV_neu"],axis=1),train["ZV_neu"])
+    test["pred_1"] = pd.Series(rf.predict(test.drop(["UANZAHL","ZV_neu"],axis=1)))
+    train["pred_1"] = pd.Series(rf.predict(train.drop(["UANZAHL","ZV_neu"],axis=1)))
+    
+    # Regression 1
+    testset_2A = test.loc[(test["pred_1"] == 1)].reset_index(drop=True)
+    trainset_2A = train.loc[(train["pred_1"] == 1)]
+    
+    rf = RandomForestRegressor(random_state=42)
+    rf.fit(trainset_2A.drop(["UANZAHL","ZV_neu","pred_1"],axis=1),trainset_2A["UANZAHL"])
+    testset_2A["pred_1"] = pd.Series(rf.predict(testset_2A.drop(["UANZAHL","ZV_neu","pred_1"],axis=1)).round())
+    
+    # Regression 2
+    testset_2B = test.loc[(test["pred_1"] == 0)].reset_index(drop=True)
+    trainset_2B = train.loc[(train["pred_1"] == 0)]
+    rf = RandomForestRegressor(random_state=42)
+    rf.fit(trainset_2B.drop(["UANZAHL","ZV_neu","pred_1"],axis=1),trainset_2B["UANZAHL"])
+    testset_2B["pred_1"] = pd.Series(rf.predict(testset_2B.drop(["UANZAHL","ZV_neu","pred_1"],axis=1)).round())
+    
+    
+    ganzes_testset = pd.concat([testset_2A,testset_2B], ignore_index = True, sort = False)
+    
+    print("MSE:",mean_squared_error(ganzes_testset["UANZAHL"], ganzes_testset["pred_1"]))
+    print("F1-Score:",f1_score(ganzes_testset["UANZAHL"], ganzes_testset["pred_1"], average='micro'))
+    print("Laufzeit:",time.time() - start)  
+    
+
+def KNN_Feature_Selection():
+    """Die Feature Selection erfolgte Manuell und das Endergebnis der genutzten Attribute ist eingestellt. Zuerst wurden Dummy-Variablen erzeugt und dem Datensatz hinzugefügt.
+    Anschließend die Daten so definiert, dass sie auf die Jahre 2016-2019 trainiert und für 2020 Evaluiert wurden."""
+    daten = pd.read_csv('daten.csv')
+    new_dum = pd.get_dummies(daten['AGS'])
+    KNN_daten = pd.concat([daten,new_dum], axis=1)
+    KNN_daten = KNN_daten.sort_values(by=['UJAHR', 'UMONAT'])
+
+    # Backward Elimination & Forward Selection
+
+    X_train = KNN_daten.drop(['AGS', 'UANZAHL', 'Bezirk', 'RB', 'Kreis', 'Gem','Bevölkerung', 'PLZ', 'RKHaftpflicht','RKVollkasko', 'RKTeilkasko', 'Anz_Fahrzeuge', 'ID'], axis=1).iloc[:-5124]
+    X_test = KNN_daten.drop(['AGS', 'UANZAHL', 'Bezirk', 'RB', 'Kreis', 'Gem','Bevölkerung', 'PLZ', 'RKHaftpflicht','RKVollkasko', 'RKTeilkasko', 'Anz_Fahrzeuge', 'ID'], axis=1).iloc[-5124:]
+    y_train = KNN_daten["UANZAHL"].iloc[:-5124]
+    y_test = KNN_daten["UANZAHL"].iloc[-5124:]
+    # Daten Normalisieren
+
+    scaler = MinMaxScaler()
+    scaler.fit(X_train)
+    X_train = scaler.transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    # Layer und Neuronen definieren
+
+    model = Sequential()
+
+    model.add(Dense(350, activation="relu"))
+    model.add(Dense(350, activation="relu"))
+    model.add(Dense(350, activation="relu"))
+    model.add(Dense(350, activation="relu"))
+    model.add(Dense(350, activation="relu"))
+
+    model.add(Dense(1, activation="relu"))
+    model.compile(optimizer="adam",loss="mse")
+
+    # Training
+
+    model.fit(X_train,y_train,epochs=1, batch_size=5124)
+
+    # Loss im Verlauf betrachten
+
+    loss = pd.DataFrame(model.history.history)
+    plt.figure()
+    loss.plot()
+
+    # Vorhersage mit tatsächlichen Werten vergleichen
+
+    test_predictions = model.predict(X_test)
+    pred_df = pd.DataFrame(y_test)
+
+    test_predcitions = pd.Series(test_predictions.reshape(5124 ,))
+    pred_df = pred_df.reset_index()
+    pred_df = pred_df.drop(columns=["index"])
+    pred_df = pd.concat([pred_df, test_predcitions],axis=1)
+    pred_df.columns = ["Test Y","Model Predictions"]
+
+    sns.set(rc={"figure.figsize":(12, 12)})
+    plt.figure()
+    sns.scatterplot(data=pred_df, x="Test Y", y="Model Predictions")
+    plt.figure()
+    g= sns.lineplot(data=pred_df, palette="tab10", linewidth=2.5)
+    
+    return(g)
+
+def Oversampling_KNN():
+    """In dieser Funktion erfolgte zuerst ein Oversampling bzw. Upsampling, um die überproportionale Verteilung der Nullen im Datensatz nicht das Modell verzerren zu lassen.
+    Dann erfolgte auf die gleiche Art und Weise wie in der Vorherigen Funktion die Messung des KNN, mit dem Unterschied, dass nur 10 Iteration erfolgten."""
+    
+    # Oversampling Prognose 2020
+
+    daten = pd.read_csv('daten.csv')
+
+    daten = daten.sort_values(by=['UJAHR', 'UMONAT'])
+    daten = daten.drop(['ID'], axis=1)
+
+    X_train_sam = daten.drop(['UANZAHL'], axis=1).loc[(daten['UJAHR'] < 2020)]
+    y_train_sam = daten['UANZAHL'].loc[(daten['UJAHR'] < 2020)]
+
+    ros = RandomOverSampler(sampling_strategy="not majority") # String
+    Xsam, ysam = ros.fit_resample(X_train_sam, y_train_sam)
+
+    start_time = datetime.now() 
+
+
+    Xsam
+    X_test_sam = daten.drop(['UANZAHL'], axis=1).loc[(daten['UJAHR'] == 2020)]
+    ysam
+    y_test_sam = daten['UANZAHL'].loc[(daten['UJAHR'] == 2020)]
+
+    # Daten Normalisieren
+
+    scaler = MinMaxScaler()
+    scaler.fit(Xsam)
+    X_train = scaler.transform(Xsam)
+    X_test = scaler.transform(X_test_sam)
+
+    # Layer und Neuronen definieren
+
+    model = Sequential()
+
+    model.add(Dense(350, activation="relu"))
+    model.add(Dense(350, activation="relu"))
+    model.add(Dense(350, activation="relu"))
+    model.add(Dense(350, activation="relu"))
+    model.add(Dense(350, activation="relu"))
+
+    model.add(Dense(1, activation="relu"))
+    model.compile(optimizer="adam",loss="mse")
+
+        # Training
+
+    model.fit(X_train,ysam,epochs=10)
+
+        # Loss im Verlauf betrachten
+
+    loss = pd.DataFrame(model.history.history)
+    plt.figure()
+    loss.plot()
+
+        # Vorhersage mit tatsächlichen Werten vergleichen
+
+    test_predictions = model.predict(X_test)
+    pred_df = pd.DataFrame(y_test_sam)
+
+    test_predcitions = pd.Series(test_predictions.reshape(5124,))
+    pred_df = pred_df.reset_index()
+    pred_df = pred_df.drop(columns=["index"])
+    pred_df = pd.concat([pred_df, test_predcitions],axis=1)
+    pred_df.columns = ["Test Y","Model Predictions"]
+
+    sns.set(rc={"figure.figsize":(12, 12)})
+    plt.figure()
+    sns.scatterplot(data=pred_df, x="Test Y", y="Model Predictions")
+    plt.figure()
+    KNN_Plot = sns.lineplot(data=pred_df, palette="tab10", linewidth=2.5)
+
+    print("F1-Score, RF:",f1_score(pred_df['Test Y'], round(pred_df['Model Predictions']), average='micro'))
+
+    time.sleep(3) 
+
+    print('Time elapsed (hh:mm:ss.ms) {}'.format(datetime.now() - start_time))
+
+
+
+def Vergleich_der_Prognosen():
+    """Die Ergebnisse wurden gespeichert, da die Laufzeiten der Modelle relativ lang sind. Hier wird in der Grafik
+    die Abweichung der Prognose von den tatsächlichen Werten angezeigt. Enthalten sind Das KNN und Random Forest."""
+    rfpred = pd.read_csv('Rfpred.csv', delimiter=',')
+    knnpred = pd.read_csv('OS_ALL_data_Final.csv', delimiter=',')
+    knnpred = knnpred.drop(['Unnamed: 0'], axis=1)
+    comp_pred = pd.concat([knnpred, rfpred], axis=1, ignore_index=True)
+    comp_pred.columns = ['Unfälle', 'KNN', 'Random Forest']
+
+    comp_pred['Random Forest'] = comp_pred['Unfälle'] - comp_pred['Random Forest']
+    comp_pred['KNN'] = comp_pred['Unfälle'] - comp_pred['KNN']
+    comp_pred['Unfälle'] = comp_pred['Unfälle'] - comp_pred['Unfälle']
+
+    sns.set_style('whitegrid')
+    n = sns.lineplot(data=comp_pred)
+    plt.xlabel('Index', fontsize = 15)
+    plt.ylabel('Abweichung der Prognose', fontsize = 15)
